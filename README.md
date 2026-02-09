@@ -67,17 +67,17 @@ Each component is designed to be explainable, privacy-preserving, and production
 
 🛠️ Tech Stack
 
-Frontend: Flutter (Mobile), React (Dashboard)
+Frontend: HTML, CSS, React (Dashboard)
 
-Backend: FastAPI, REST APIs, WebSockets
+Backend: FastAPI, REST APIs, Javascript
 
 AI/ML: Python, Scikit-learn, TensorFlow, OpenCV
 
-Geospatial: PostgreSQL + PostGIS
+Geospatial: PostgreSQL + PostGI
 
 Realtime: WebSockets / Firebase
 
-Voice AI: Speech-to-Text APIs
+Voice AI: Speech-to-Text APIs(openai whispr)
 
 LLM: API-based conversational language models
 
