@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import queue
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import difflib
 import re
@@ -336,126 +335,42 @@ def resolve_paths() -> EnginePaths:
     return EnginePaths(root_dir=root_dir, data_dir=data_dir, models_dir=models_dir)
 
 
-def resolve_settings(args: argparse.Namespace) -> EngineSettings:
-    device = args.device
+@dataclass
+class EngineConfig:
+    model_name: str = "base"
+    language: Optional[str] = None
+    task: str = "transcribe"
+    device: str = "auto"
+    fp16: bool = False
+    sample_rate: int = 16000
+    frame_ms: int = 30
+    min_chunk_ms: int = 1200
+    silence_ms: int = 600
+    energy_factor: float = 3.0
+    idle_sleep_ms: int = 20
+    highpass_hz: int = 100
+    preemph: float = 0.97
+    emergency_keywords: list[str] = field(default_factory=list)
+    emergency_phrases: list[str] = field(default_factory=list)
+    emergency_threshold: float = 0.82
+    models_dir: Optional[Path] = None
+
+
+def resolve_settings_from_config(cfg: EngineConfig) -> EngineSettings:
+    device = cfg.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    fp16 = args.fp16 and device == "cuda"
+    fp16 = cfg.fp16 and device == "cuda"
     return EngineSettings(
-        model_name=args.model,
-        language=args.language,
-        task=args.task,
+        model_name=cfg.model_name,
+        language=cfg.language,
+        task=cfg.task,
         device=device,
         fp16=fp16,
     )
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="voice_ai", description="Local Whisper speech recognition")
-    subparsers = parser.add_subparsers(dest="mode", required=True)
-
-    file_parser = subparsers.add_parser("file", help="Transcribe an audio file")
-    file_parser.add_argument("--input", required=True, type=str, help="Path to audio file")
-
-    mic_parser = subparsers.add_parser("mic", help="Record from microphone and transcribe")
-    mic_parser.add_argument("--duration", type=float, default=5.0, help="Recording duration in seconds")
-    mic_parser.add_argument("--sample-rate", type=int, default=16000, help="Microphone sample rate")
-
-    listen_parser = subparsers.add_parser("listen", help="Continuous listening and low-latency transcription")
-    listen_parser.add_argument("--sample-rate", type=int, default=16000, help="Microphone sample rate")
-    listen_parser.add_argument("--frame-ms", type=int, default=30, help="Frame size in ms")
-    listen_parser.add_argument("--min-chunk-ms", type=int, default=1200, help="Minimum voiced chunk length")
-    listen_parser.add_argument("--silence-ms", type=int, default=600, help="Silence to end utterance")
-    listen_parser.add_argument("--energy-factor", type=float, default=3.0, help="Energy factor above noise floor")
-    listen_parser.add_argument("--idle-sleep-ms", type=int, default=20, help="Sleep when idle")
-    listen_parser.add_argument("--highpass-hz", type=int, default=100, help="High-pass cutoff")
-    listen_parser.add_argument("--preemph", type=float, default=0.97, help="Preemphasis coefficient")
-
-    for sub in (file_parser, mic_parser):
-        sub.add_argument("--model", type=str, default="base", help="Whisper model size")
-        sub.add_argument("--language", type=str, default=None, help="Spoken language code")
-        sub.add_argument("--task", type=str, default="transcribe", choices=["transcribe", "translate"])
-        sub.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
-        sub.add_argument("--fp16", action="store_true", help="Enable fp16 when using CUDA")
-        sub.add_argument("--json", action="store_true", help="Output JSON instead of plain text")
-        sub.add_argument("--emergency-keyword", action="append", default=[], help="Add distress keyword")
-        sub.add_argument("--emergency-phrase", action="append", default=[], help="Add distress phrase")
-        sub.add_argument("--emergency-threshold", type=float, default=0.82, help="Fuzzy match threshold [0-1]")
-
-    for sub in (listen_parser,):
-        sub.add_argument("--model", type=str, default="base", help="Whisper model size")
-        sub.add_argument("--language", type=str, default=None, help="Spoken language code")
-        sub.add_argument("--task", type=str, default="transcribe", choices=["transcribe", "translate"])
-        sub.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
-        sub.add_argument("--fp16", action="store_true", help="Enable fp16 when using CUDA")
-        sub.add_argument("--json", action="store_true", help="Output JSON instead of plain text")
-        sub.add_argument("--emergency-keyword", action="append", default=[], help="Add distress keyword")
-        sub.add_argument("--emergency-phrase", action="append", default=[], help="Add distress phrase")
-        sub.add_argument("--emergency-threshold", type=float, default=0.82, help="Fuzzy match threshold [0-1]")
-
-    return parser
-
-
-def output_result(result: dict[str, Any], as_json: bool) -> None:
-    if as_json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-    else:
-        print(result.get("transcription", "").strip())
-
-
-def run_file_mode(engine: WhisperEngine, args: argparse.Namespace) -> dict[str, Any]:
-    audio_path = Path(args.input).expanduser().resolve()
-    start = time.perf_counter()
-    result = engine.transcribe_file(audio_path)
-    latency_ms = (time.perf_counter() - start) * 1000.0
-    detector = build_distress_detector(args)
-    return build_structured_output(result, latency_ms, detector)
-
-
-def run_listen_mode(engine: WhisperEngine, args: argparse.Namespace) -> None:
-    nf = NoiseFilter(sample_rate=args.sample_rate, highpass_hz=args.highpass_hz, preemph=args.preemph)
-    listener = ContinuousListener(
-        sample_rate=args.sample_rate,
-        frame_ms=args.frame_ms,
-        min_chunk_ms=args.min_chunk_ms,
-        silence_ms=args.silence_ms,
-        energy_factor=args.energy_factor,
-        idle_sleep_ms=args.idle_sleep_ms,
-        noise_filter=nf,
-    )
-    detector = build_distress_detector(args)
-    try:
-        listener.start()
-        while True:
-            chunk = listener.next_chunk()
-            if chunk is None:
-                continue
-            start = time.perf_counter()
-            result = engine.transcribe_audio(chunk)
-            latency_ms = (time.perf_counter() - start) * 1000.0
-            payload = build_structured_output(result, latency_ms, detector)
-            print(json.dumps(payload, ensure_ascii=False))
-    finally:
-        listener.stop()
-
-def run_mic_mode(engine: WhisperEngine, args: argparse.Namespace) -> dict[str, Any]:
-    capture = RealTimeAudioCapture(sample_rate=args.sample_rate)
-    try:
-        capture.start()
-        audio = capture.capture_utterance(max_seconds=max(3.0, args.duration))
-    finally:
-        capture.stop()
-    if audio.size == 0:
-        logging.warning("No speech detected")
-        return {"transcription": "", "confidence": 0.0, "latency_ms": 0.0, "emergency_flag": False, "trigger_reason": ""}
-    start = time.perf_counter()
-    result = engine.transcribe_audio(audio)
-    latency_ms = (time.perf_counter() - start) * 1000.0
-    detector = build_distress_detector(args)
-    return build_structured_output(result, latency_ms, detector)
-
-
-def build_distress_detector(args: argparse.Namespace) -> DistressDetector:
+def build_distress_detector_from_config(cfg: EngineConfig) -> DistressDetector:
     default_keywords = [
         "help",
         "emergency",
@@ -479,42 +394,85 @@ def build_distress_detector(args: argparse.Namespace) -> DistressDetector:
         "stop it",
         "don't touch me",
     ]
-    merged_keywords = default_keywords + (args.emergency_keyword or [])
-    merged_phrases = default_phrases + (args.emergency_phrase or [])
-    cfg = DistressConfig(keywords=merged_keywords, phrases=merged_phrases, min_similarity=float(args.emergency_threshold))
-    return DistressDetector(cfg)
+    merged_keywords = default_keywords + (cfg.emergency_keywords or [])
+    merged_phrases = default_phrases + (cfg.emergency_phrases or [])
+    cfg_d = DistressConfig(keywords=merged_keywords, phrases=merged_phrases, min_similarity=float(cfg.emergency_threshold))
+    return DistressDetector(cfg_d)
+
+
+class VoiceAIEngine:
+    def __init__(self, config: Optional[EngineConfig] = None) -> None:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        self.cfg = config or EngineConfig()
+        paths = resolve_paths()
+        models_dir = self.cfg.models_dir or paths.models_dir
+        self.paths = EnginePaths(root_dir=paths.root_dir, data_dir=paths.data_dir, models_dir=models_dir)
+        self.settings = resolve_settings_from_config(self.cfg)
+        self.engine = WhisperEngine(paths=self.paths, settings=self.settings)
+        self.detector = build_distress_detector_from_config(self.cfg)
+        self.noise_filter = NoiseFilter(sample_rate=self.cfg.sample_rate, highpass_hz=self.cfg.highpass_hz, preemph=self.cfg.preemph)
+        self.listener = ContinuousListener(
+            sample_rate=self.cfg.sample_rate,
+            frame_ms=self.cfg.frame_ms,
+            min_chunk_ms=self.cfg.min_chunk_ms,
+            silence_ms=self.cfg.silence_ms,
+            energy_factor=self.cfg.energy_factor,
+            idle_sleep_ms=self.cfg.idle_sleep_ms,
+            noise_filter=self.noise_filter,
+        )
+
+    def transcribe_file(self, audio_path: str | Path) -> dict[str, Any]:
+        p = Path(audio_path).expanduser().resolve()
+        start = time.perf_counter()
+        result = self.engine.transcribe_file(p)
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        return build_structured_output(result, latency_ms, self.detector)
+
+    def transcribe_array(self, audio: np.ndarray) -> dict[str, Any]:
+        if audio.size == 0:
+            return {"transcription": "", "confidence": 0.0, "latency_ms": 0.0, "emergency_flag": False, "trigger_reason": ""}
+        start = time.perf_counter()
+        result = self.engine.transcribe_audio(audio)
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        return build_structured_output(result, latency_ms, self.detector)
+
+    def record_and_transcribe(self, duration_s: float) -> dict[str, Any]:
+        recorder = AudioRecorder(sample_rate=self.cfg.sample_rate)
+        audio = recorder.record(duration_s)
+        return self.transcribe_array(audio)
+
+    def listen(self) -> Iterator[dict[str, Any]]:
+        self.listener.start()
+        try:
+            while True:
+                chunk = self.listener.next_chunk()
+                if chunk is None:
+                    continue
+                start = time.perf_counter()
+                result = self.engine.transcribe_audio(chunk)
+                latency_ms = (time.perf_counter() - start) * 1000.0
+                yield build_structured_output(result, latency_ms, self.detector)
+        finally:
+            self.listener.stop()
+
+
+def run_file_mode(engine: WhisperEngine, args: argparse.Namespace) -> dict[str, Any]:
+    raise RuntimeError("CLI has been removed; use VoiceAIEngine")
+
+
+def run_listen_mode(engine: WhisperEngine, args: argparse.Namespace) -> None:
+    raise RuntimeError("CLI has been removed; use VoiceAIEngine.listen()")
+
+def run_mic_mode(engine: WhisperEngine, args: argparse.Namespace) -> dict[str, Any]:
+    raise RuntimeError("CLI has been removed; use VoiceAIEngine.record_and_transcribe()")
+
+
+def build_distress_detector(args: argparse.Namespace) -> DistressDetector:
+    raise RuntimeError("CLI has been removed; use build_distress_detector_from_config()")
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    parser = build_arg_parser()
-    args = parser.parse_args()
-
-    paths = resolve_paths()
-    settings = resolve_settings(args)
-    engine = WhisperEngine(paths=paths, settings=settings)
-
-    if args.mode == "file":
-        try:
-            result = run_file_mode(engine, args)
-        except Exception as e:
-            logging.exception(f"File mode error: {e}")
-            result = {"transcription": "", "confidence": 0.0, "latency_ms": 0.0}
-    elif args.mode == "mic":
-        try:
-            result = run_mic_mode(engine, args)
-        except Exception as e:
-            logging.exception(f"Mic mode error: {e}")
-            result = {"transcription": "", "confidence": 0.0, "latency_ms": 0.0}
-    else:
-        try:
-            run_listen_mode(engine, args)
-            return
-        except Exception as e:
-            logging.exception(f"Listen mode error: {e}")
-            result = {"transcription": "", "confidence": 0.0, "latency_ms": 0.0}
-
-    output_result(result, args.json)
+    raise RuntimeError("CLI has been removed; import VoiceAIEngine and call its methods")
 
 
 if __name__ == "__main__":
