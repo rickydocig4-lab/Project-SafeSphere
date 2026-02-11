@@ -342,8 +342,6 @@ def _calculate_route_risk(route_geo: Dict, incidents: List[Dict]) -> float:
         return 0.0
     
     total_risk = 0.0
-    # Sample points to avoid heavy computation (every 10th point)
-    sample_points = coordinates[::10]
     # Sample points to avoid heavy computation (every 2nd point for better precision)
     sample_points = coordinates[::2]
     if not sample_points:
@@ -367,7 +365,6 @@ def _calculate_route_risk(route_geo: Dict, incidents: List[Dict]) -> float:
             
             # If incident is within 300m of route path
             if dist < 0.3:
-                severity = _severity_weight(inc.get("threat_level", "LOW"), inc.get("threat_score", 0.0))
                 base_severity = _severity_weight(inc.get("threat_level", "LOW"), inc.get("threat_score", 0.0))
                 
                 # Apply multipliers for route selection to strongly discourage high threats
@@ -382,7 +379,6 @@ def _calculate_route_risk(route_geo: Dict, incidents: List[Dict]) -> float:
                 
                 # Higher risk if closer
                 proximity_factor = (1.0 - (dist / 0.3))
-                total_risk += severity * proximity_factor
                 total_risk += base_severity * multiplier * proximity_factor
 
     return total_risk
@@ -490,8 +486,6 @@ async def calculate_safe_route(req: RouteRequest):
                 "risk_score": round(risk_score, 2)
             })
         
-        # 4. Sort by risk score (lowest first)
-        scored_routes.sort(key=lambda x: x["risk_score"])
         # 4. Sort by risk score (lowest first), then by distance
         # This ensures we pick the safest route, even if it's much longer
         scored_routes.sort(key=lambda x: (x["risk_score"], x["distance"]))

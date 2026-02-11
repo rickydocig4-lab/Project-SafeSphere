@@ -801,7 +801,6 @@ try {
                             const coords = routeData.route.geometry.coordinates.map(c => [c[1], c[0]]); // GeoJSON is lng,lat -> Leaflet lat,lng
                             
                             // Color based on risk
-                            const color = routeData.risk_score > 5 ? '#ef4444' : (routeData.risk_score > 1 ? '#f59e0b' : '#10b981');
                             // Adjusted for new high penalties (>50 is likely a high threat)
                             const color = routeData.risk_score > 50 ? '#ef4444' : (routeData.risk_score > 1 ? '#f59e0b' : '#10b981');
                             
