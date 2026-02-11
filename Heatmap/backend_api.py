@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
 import json
@@ -336,6 +336,36 @@ def _get_osrm_routes(start_lat: float, start_lng: float, end_lat: float, end_lng
         print(f"⚠️ OSRM routing failed: {e}")
     return []
 
+
+def _get_osrm_routes_via(start_lat: float, start_lng: float, via_lat: float, via_lng: float, end_lat: float, end_lng: float) -> List[Dict]:
+    """Fetch route from OSRM going through a via point (start;via;end)."""
+    try:
+        url = f"http://router.project-osrm.org/route/v1/driving/{start_lng},{start_lat};{via_lng},{via_lat};{end_lng},{end_lat}?overview=full&geometries=geojson&alternatives=true"
+        response = requests.get(url, timeout=6)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("routes", [])
+    except Exception as e:
+        print(f"⚠️ OSRM routing via failed: {e}")
+    return []
+
+
+def _destination_point(lat: float, lng: float, bearing_deg: float, distance_km: float) -> Tuple[float, float]:
+    """
+    Calculate destination point given start lat/lng, bearing (degrees) and distance (km).
+    Returns (lat, lng).
+    """
+    R = 6371.0
+    bearing = math.radians(bearing_deg)
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lng)
+    d_div_r = distance_km / R
+
+    lat2 = math.asin(math.sin(lat1) * math.cos(d_div_r) + math.cos(lat1) * math.sin(d_div_r) * math.cos(bearing))
+    lon2 = lon1 + math.atan2(math.sin(bearing) * math.sin(d_div_r) * math.cos(lat1), math.cos(d_div_r) - math.sin(lat1) * math.sin(lat2))
+
+    return (math.degrees(lat2), math.degrees(lon2))
+
 def _calculate_route_risk(route_geo: Dict, incidents: List[Dict]) -> tuple:
     """
     Calculate route safety with HARD threat avoidance.
@@ -351,126 +381,104 @@ def _calculate_route_risk(route_geo: Dict, incidents: List[Dict]) -> tuple:
     coordinates = route_geo.get("coordinates", [])
     if not coordinates:
         return (True, 1.0, {"reason": "no_coordinates"})
-    
-    # Check if ANY route segment crosses a threat circle
-    threat_radii_map = {
-        "CRITICAL": 1.5,
-        "HIGH": 1.2,
-        "MEDIUM": 0.8,
-        "LOW": 0.5
-    }
-    
-    safety_buffer = 0.1  # 100m buffer
-    
-    # Check each coordinate pair (line segment)
-    for i in range(len(coordinates) - 1):
-        lng1, lat1 = coordinates[i]
-        lng2, lat2 = coordinates[i + 1]
-        
-        # Check this segment against all threat zones
-        for inc in incidents:
-            i_lat = inc.get("latitude")
-            i_lng = inc.get("longitude")
-            threat_level = inc.get("threat_level", "MEDIUM").upper()
-            
-            if i_lat is None or i_lng is None:
-                continue
-            
-            # Get threat radius
-            threat_radius = threat_radii_map.get(threat_level, 0.8)
-            effective_radius = threat_radius + safety_buffer
-            
-            # Quick bounding box check first (fast rejection)
-            bb_margin = effective_radius / 111.0  # ~111 km per degree lat
-            if not ((min(lat1, lat2) - bb_margin <= i_lat <= max(lat1, lat2) + bb_margin) and
-                    (min(lng1, lng2) - bb_margin <= i_lng <= max(lng1, lng2) + bb_margin)):
-                continue
-            
-            # Calculate distance from threat center to line segment
-            dist = _distance_point_to_segment(i_lat, i_lng, lat1, lng1, lat2, lng2)
-            
-            # If segment gets too close to threat, route is unsafe
-            if dist < effective_radius:
-                return (False, 0.0, {
-                    "reason": "threat_intersection",
-                    "threat_id": inc.get("incident_id"),
-                    "threat_level": threat_level,
-                    "distance_to_threat": round(max(0, dist - threat_radius), 3)
-                })
-    
-    # No threats intersect - calculate safety score based on closest threat
+
+    # Simplified safety rule requested: compare each route point to incident lat/lng
+    # Buffer: 50 meters (0.05 km) from incident location
+    buffer_km = 0.05
+
     min_distance = float('inf')
     closest_threat = None
-    
-    for i in range(len(coordinates) - 1):
-        lng1, lat1 = coordinates[i]
-        lng2, lat2 = coordinates[i + 1]
-        
+
+    # Coordinates are provided as [lng, lat] pairs
+    for coord in coordinates:
+        try:
+            lng = float(coord[0])
+            lat = float(coord[1])
+        except Exception:
+            continue
+
         for inc in incidents:
-            i_lat = inc.get("latitude")
-            i_lng = inc.get("longitude")
-            
-            if i_lat is None or i_lng is None:
+            try:
+                i_lat = float(inc.get("latitude"))
+                i_lng = float(inc.get("longitude"))
+            except Exception:
                 continue
-            
-            dist = _distance_point_to_segment(i_lat, i_lng, lat1, lng1, lat2, lng2)
-            
-            if dist < min_distance:
-                min_distance = dist
+
+            d = _haversine_km(lat, lng, i_lat, i_lng)
+            if d < min_distance:
+                min_distance = d
                 closest_threat = inc
-    
-    # Safety score: 1.0 if >3km away, decreases as threats get closer
-    if min_distance >= 3.0:
-        safety_score = 1.0
-    elif min_distance > 0:
-        safety_score = max(0.1, min_distance / 3.0)
+
+            # If any route point falls within 50m of an incident, route is unsafe
+            if d <= buffer_km:
+                return (False, 0.0, {
+                    "reason": "threat_intersection_point",
+                    "threat_id": inc.get("incident_id"),
+                    "distance_to_threat_km": round(d, 4)
+                })
+
+    # No points are within 50m of any incident -> route considered safe
+    if not math.isfinite(min_distance) or closest_threat is None:
+        closest_km = None
     else:
-        safety_score = 0.1
-    
+        closest_km = round(min_distance, 3)
+
+    # Safety score: 1.0 if >3km away, scale down otherwise
+    if closest_km is None:
+        safety_score = 1.0
+    elif closest_km >= 3.0:
+        safety_score = 1.0
+    else:
+        safety_score = max(0.1, closest_km / 3.0)
+
     return (True, round(safety_score, 3), {
         "reason": "safe",
-        "closest_threat_km": round(min_distance, 3),
+        "closest_threat_km": closest_km,
         "closest_threat_id": closest_threat.get("incident_id") if closest_threat else None
     })
 
 
-def _distance_point_to_segment(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+def _distance_point_to_segment(point_lat: float, point_lng: float, lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """
-    Calculate distance from point (px, py) to line segment from (x1, y1) to (x2, y2).
-    Uses approximate Cartesian conversion for accuracy.
-    Returns distance in kilometers.
+    Calculate distance from point (point_lat, point_lng) to line segment
+    from (lat1, lng1) to (lat2, lng2).
+
+    Uses an equirectangular approximation (valid for short distances):
+    - converts degrees -> kilometers using per-degree scale factors
+    - computes closest point on segment and returns distance in kilometers
     """
-    # Approximate Cartesian conversion (valid for small distances)
-    lat_center = (y1 + y2) / 2
-    scale_lng = 111.0 * math.cos(math.radians(lat_center))
-    scale_lat = 111.0
-    
-    x1_c = x1 * scale_lng
-    y1_c = y1 * scale_lat
-    x2_c = x2 * scale_lng
-    y2_c = y2 * scale_lat
-    px_c = px * scale_lng
-    py_c = py * scale_lat
-    
+    # Center latitude for longitude scaling
+    lat_center = (lat1 + lat2) / 2.0
+    scale_lng = 111.0 * math.cos(math.radians(lat_center))  # km per degree longitude
+    scale_lat = 111.0  # km per degree latitude
+
+    # Convert to km (cartesian approximation)
+    x1_c = lng1 * scale_lng
+    y1_c = lat1 * scale_lat
+    x2_c = lng2 * scale_lng
+    y2_c = lat2 * scale_lat
+    px_c = point_lng * scale_lng
+    py_c = point_lat * scale_lat
+
     # Vector from p1 to p2
     dx = x2_c - x1_c
     dy = y2_c - y1_c
-    
-    # If segment is a point
+
+    # If segment is a point, return distance to that point (already in km)
     if dx == 0 and dy == 0:
-        return math.sqrt((px_c - x1_c)**2 + (py_c - y1_c)**2) / 111.0
-    
-    # Project point onto line
+        return math.sqrt((px_c - x1_c) ** 2 + (py_c - y1_c) ** 2)
+
+    # Project point onto the line (parameter t)
     t = ((px_c - x1_c) * dx + (py_c - y1_c) * dy) / (dx * dx + dy * dy)
     t = max(0.0, min(1.0, t))
-    
+
     # Closest point on segment
     closest_x = x1_c + t * dx
     closest_y = y1_c + t * dy
-    
+
     # Distance in km
-    dist_km = math.sqrt((px_c - closest_x)**2 + (py_c - closest_y)**2) / 111.0
-    
+    dist_km = math.sqrt((px_c - closest_x) ** 2 + (py_c - closest_y) ** 2)
+
     return dist_km
 
 
@@ -555,25 +563,43 @@ async def calculate_safe_route(req: RouteRequest):
         incidents = _load_incidents_from_db(limit=500)
         
         # 3. Filter incidents for visualization (near the route area)
-        margin = 0.05  # ~5km buffer
+        # Use a slightly tighter margin to avoid including distant incidents
+        margin = 0.04  # ~4km buffer
         min_lat = min(req.start_lat, req.end_lat) - margin
         max_lat = max(req.start_lat, req.end_lat) + margin
         min_lng = min(req.start_lng, req.end_lng) - margin
         max_lng = max(req.start_lng, req.end_lng) + margin
-        
+
         nearby_threats = []
         for inc in incidents:
-            lat = inc.get("latitude")
-            lng = inc.get("longitude")
-            if lat is not None and lng is not None and min_lat <= lat <= max_lat and min_lng <= lng <= max_lng:
-                nearby_threats.append(inc)
+            lat_raw = inc.get("latitude")
+            lng_raw = inc.get("longitude")
+            if lat_raw is None or lng_raw is None:
+                continue
+            try:
+                lat = float(lat_raw)
+                lng = float(lng_raw)
+            except Exception:
+                continue
+
+            if min_lat <= lat <= max_lat and min_lng <= lng <= max_lng:
+                # Sanitize and store minimal threat info for downstream checks
+                nearby_threats.append({
+                    "incident_id": inc.get("incident_id"),
+                    "latitude": lat,
+                    "longitude": lng,
+                    "threat_level": (inc.get("threat_level") or "MEDIUM").upper(),
+                    "threat_score": float(inc.get("threat_score") or 0.0),
+                    "behavior_summary": inc.get("behavior_summary")
+                })
         
         # 4. Evaluate each route for safety
         safe_routes = []
         unsafe_routes = []
         
         for route in routes:
-            is_safe, safety_score, threat_info = _calculate_route_risk(route["geometry"], incidents)
+            # Evaluate route safety only against nearby threats (reduces false positives)
+            is_safe, safety_score, threat_info = _calculate_route_risk(route["geometry"], nearby_threats)
             
             route_data = {
                 "geometry": route["geometry"],
@@ -592,34 +618,81 @@ async def calculate_safe_route(req: RouteRequest):
         # 5. Sort safe routes by safety_score (highest first = safest)
         safe_routes.sort(key=lambda x: x["safety_score"], reverse=True)
         
-        # 6. Select best route
+        # 6. Select best route (prefer fully safe routes)
         if safe_routes:
-            # Use a safe route
             best_route = safe_routes[0]
             routing_mode = "SAFE"
             routes_analyzed = len(routes)
             safe_count = len(safe_routes)
         else:
-            # No safe routes found - this is an error condition
-            # Don't return any route
-            print(f"⚠️ WARNING: ALL {len(routes)} OSRM routes pass through threat zones!")
-            print(f"   Start: ({req.start_lat}, {req.start_lng})")
-            print(f"   End: ({req.end_lat}, {req.end_lng})")
-            for unsafe in unsafe_routes[:3]:
-                print(f"   Rejected route: {unsafe['threat_info']}")
-            
-            return {
-                "success": False,
-                "error": "NO_SAFE_ROUTES",
-                "message": f"All {len(routes)} available routes pass through threat zones. Cannot provide safe route.",
-                "threats_blocking": nearby_threats,
-                "unsafe_routes_count": len(unsafe_routes),
-                "recommendations": [
-                    "Wait for threats to clear",
-                    "Choose a different destination",
-                    "Consider a much longer detour"
-                ]
+            # No fully safe routes found — attempt to create detours around nearby threats
+            # Define threat radii and safety buffer (same values used in _calculate_route_risk)
+            threat_radii_map = {
+                "CRITICAL": 1.2,
+                "HIGH": 1.0,
+                "MEDIUM": 0.6,
+                "LOW": 0.3
             }
+            safety_buffer = 0.05
+            print(f"⚠️ No fully safe OSRM routes found. Attempting waypoint detours around threats...")
+            detour_found = None
+            # Bearings to try around a threat (degrees)
+            bearings = [0, 45, 90, 135, 180, 225, 270, 315]
+
+            for threat in nearby_threats:
+                try:
+                    t_lat = float(threat.get("latitude"))
+                    t_lng = float(threat.get("longitude"))
+                    t_level = (threat.get("threat_level") or "MEDIUM").upper()
+                    t_radius = threat_radii_map.get(t_level, 0.6)
+                except Exception:
+                    continue
+
+                # Try offsets around the threat at increasing radii
+                for extra in [0.2, 0.5, 1.0]:
+                    offset_km = t_radius + safety_buffer + extra
+                    for b in bearings:
+                        via_lat, via_lng = _destination_point(t_lat, t_lng, b, offset_km)
+                        # Request a route via this waypoint
+                        alt_routes = _get_osrm_routes_via(req.start_lat, req.start_lng, via_lat, via_lng, req.end_lat, req.end_lng)
+                        for alt in alt_routes:
+                            is_safe_alt, safety_score_alt, threat_info_alt = _calculate_route_risk(alt.get("geometry", {}), nearby_threats)
+                            if is_safe_alt:
+                                detour_found = {
+                                    "geometry": alt.get("geometry"),
+                                    "distance": alt.get("distance"),
+                                    "duration": alt.get("duration"),
+                                    "safety_score": safety_score_alt,
+                                    "threat_info": threat_info_alt
+                                }
+                                break
+                        if detour_found:
+                            break
+                    if detour_found:
+                        break
+                if detour_found:
+                    break
+
+            if detour_found:
+                best_route = detour_found
+                routing_mode = "SAFE_VIA_DETOUR"
+                routes_analyzed = len(routes)
+                safe_count = 1
+            else:
+                # Still no safe routes after attempting detours
+                print(f"⚠️ WARNING: ALL {len(routes)} OSRM routes and detours pass through threat zones!")
+                return {
+                    "success": False,
+                    "error": "NO_SAFE_ROUTES",
+                    "message": f"All {len(routes)} available routes (including detours) pass through threat zones. Cannot provide safe route.",
+                    "threats_blocking": nearby_threats,
+                    "unsafe_routes_count": len(unsafe_routes),
+                    "recommendations": [
+                        "Wait for threats to clear",
+                        "Choose a different destination",
+                        "Consider calling for assistance"
+                    ]
+                }
         
         return {
             "success": True,

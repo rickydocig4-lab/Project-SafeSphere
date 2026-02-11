@@ -246,7 +246,7 @@ class ThreatZoneManager:
         
         # If the segment is a point, return distance to that point
         if dx == 0 and dy == 0:
-            return math.sqrt((px - x1)**2 + (py - y1)**2) / 111.0
+            return math.sqrt((px - x1)**2 + (py - y1)**2)
         
         # Project point onto the line
         # t = ((px-x1)*dx + (py-y1)*dy) / (dx*dx + dy*dy)
@@ -259,9 +259,9 @@ class ThreatZoneManager:
         closest_x = x1 + t * dx
         closest_y = y1 + t * dy
         
-        # Distance in kilometers
-        dist_km = math.sqrt((px - closest_x)**2 + (py - closest_y)**2) / 111.0
-        
+        # Distance in kilometers (x/y were computed in km)
+        dist_km = math.sqrt((px - closest_x)**2 + (py - closest_y)**2)
+
         return dist_km
     
     def route_intersects_any_threat(

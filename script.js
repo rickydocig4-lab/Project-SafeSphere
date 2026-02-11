@@ -1215,6 +1215,7 @@ try {
                         });
                         
                         const routeData = await apiRes.json();
+                        console.log('Route API response:', apiRes.status, routeData);
 
                         if (routeData.success && routeData.route) {
                             if (routeLayer) map.removeLayer(routeLayer);
@@ -1223,9 +1224,12 @@ try {
                             // Draw route
                             const coords = routeData.route.geometry.coordinates.map(c => [c[1], c[0]]); // GeoJSON is lng,lat -> Leaflet lat,lng
                             
-                            // Color based on risk
-                            // Adjusted for new high penalties (>50 is likely a high threat)
-                            const color = routeData.risk_score > 50 ? '#ef4444' : (routeData.risk_score > 1 ? '#f59e0b' : '#10b981');
+                            // Determine safety score (backend uses `safety_score` 0.0-1.0)
+                            const safetyScore = (routeData.route && routeData.route.safety_score) || routeData.safety_score || 1.0;
+                            // Color: green (safe), amber (moderate), red (danger)
+                            let color = '#10b981';
+                            if (safetyScore < 0.4) color = '#ef4444';
+                            else if (safetyScore < 0.7) color = '#f59e0b';
                             
                             routeLayer = L.polyline(coords, {
                                 color: color,
@@ -1234,40 +1238,53 @@ try {
                                 lineCap: 'round'
                             }).addTo(map);
 
-                            // Draw threats
-                            if (routeData.threats && routeData.threats.length > 0) {
-                                routeData.threats.forEach(threat => {
+                            // Draw threats (backend may return `threats`, `threats_near_route`, or `threat_details`)
+                            const threats = routeData.threats || routeData.threats_near_route || (routeData.threat_details ? (Array.isArray(routeData.threat_details) ? routeData.threat_details : [routeData.threat_details]) : []);
+                            if (threats && threats.length > 0) {
+                                threats.forEach(threat => {
                                     const tLat = threat.latitude;
                                     const tLng = threat.longitude;
-                                    const level = threat.threat_level || 'MEDIUM';
-                                    
+                                    const level = (threat.threat_level || threat.threatLevel || 'MEDIUM').toUpperCase();
                                     let tColor = '#f59e0b';
                                     if (level === 'HIGH' || level === 'CRITICAL') tColor = '#ef4444';
-                                    
+                                    const radiusKm = threat.radius_km || threat.radiusKm || 0.8;
                                     L.circle([tLat, tLng], {
                                         color: tColor,
                                         fillColor: tColor,
-                                        fillOpacity: 0.3,
-                                        radius: 100,
+                                        fillOpacity: 0.18,
+                                        radius: (radiusKm * 1000),
                                         weight: 1
                                     }).addTo(threatLayer).bindPopup(`
                                         <strong>${level} THREAT</strong><br>
-                                        ${threat.behavior_summary || 'Suspicious activity'}
+                                        ${threat.behavior_summary || threat.summary || 'Suspicious activity'}
                                     `);
                                 });
                             }
 
                             // Update UI
-                            badge.textContent = routeData.safety_status;
+                            badge.textContent = routeData.routing_mode || 'SAFE';
                             badge.style.background = color;
                             msg.innerHTML = `
                                 <strong>Best Route Found</strong><br>
-                                Risk Score: ${routeData.risk_score}<br>
-                                Analyzed ${routeData.alternatives_analyzed} alternatives.<br>
-                                Avoiding high-threat zones.
+                                Safety Score: ${Math.round((safetyScore || 0) * 100)}%<br>
+                                Analyzed ${routeData.routes_analyzed || routeData.alternatives_analyzed || 1} alternatives.<br>
+                                Avoiding identified threat zones.
                             `;
                         } else {
+                            // Log detailed backend response for debugging
+                            console.warn('Safe route not available:', routeData);
+                            // If backend provided an error payload, log specifics
+                            if (routeData && routeData.error) {
+                                console.error('Route calculation error:', routeData.error, routeData.message || '', routeData.threats_blocking || routeData.threats_near_route || routeData.threat_details || null);
+                            } else if (routeData && routeData.threats_blocking) {
+                                console.info('Threats blocking routes:', routeData.threats_blocking);
+                            }
+
                             msg.textContent = 'Could not calculate a safe route.';
+                            // Optionally show recommendation if backend provided it
+                            if (routeData && routeData.recommendations && Array.isArray(routeData.recommendations)) {
+                                msg.innerHTML += '<br><small>' + routeData.recommendations.join(' · ') + '</small>';
+                            }
                         }
 
                     } catch (error) {
